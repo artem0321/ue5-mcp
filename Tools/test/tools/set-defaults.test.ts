@@ -84,6 +84,39 @@ describe("set_blueprint_default — subobject path", () => {
     });
     expect(data.error).toBeDefined();
   });
+
+  it("auto-wraps struct literals missing parens (FVector RelativeLocation)", async () => {
+    const data = await uePost("/api/set-blueprint-default", {
+      blueprint: bpName,
+      property: "Mesh.RelativeLocation",
+      value: "X=1,Y=2,Z=3",
+    });
+    expect(data.error).toBeUndefined();
+    expect(data.success).toBe(true);
+    // Export form is canonical — exact string varies across UE minors but must contain the values
+    expect(data.newValue).toMatch(/X=1.*Y=2.*Z=3/);
+  });
+
+  it("accepts struct literals already wrapped in parens", async () => {
+    const data = await uePost("/api/set-blueprint-default", {
+      blueprint: bpName,
+      property: "Mesh.RelativeLocation",
+      value: "(X=4,Y=5,Z=6)",
+    });
+    expect(data.error).toBeUndefined();
+    expect(data.success).toBe(true);
+    expect(data.newValue).toMatch(/X=4.*Y=5.*Z=6/);
+  });
+
+  it("error for unparseable struct literal includes parens hint", async () => {
+    const data = await uePost("/api/set-blueprint-default", {
+      blueprint: bpName,
+      property: "Mesh.RelativeLocation",
+      value: "not_a_vector",
+    });
+    expect(data.error).toBeDefined();
+    expect(data.error).toMatch(/parens/i);
+  });
 });
 
 describe("set_pin_default", () => {

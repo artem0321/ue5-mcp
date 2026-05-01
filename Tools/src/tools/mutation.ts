@@ -559,11 +559,11 @@ export function registerMutationTools(server: McpServer): void {
 
   server.tool(
     "set_blueprint_default",
-    "Set a default property value on a Blueprint's Class Default Object (CDO). Supports TSubclassOf (class references), object references (assets like SkeletalMesh, StaticMesh, etc.), and simple types (bool, int, float, string, enum, struct). For class/object values, provide the Blueprint asset name, C++ class name, or full asset path. Supports dotted paths to traverse component subobjects (e.g. 'Mesh.SkeletalMesh', 'Mesh.AnimClass', 'CharacterMovement.MaxWalkSpeed', 'CameraBoom.TargetArmLength'). Nested-struct paths inside a subobject (e.g. 'Mesh.RelativeLocation.X') are NOT supported — pass a struct literal instead (property='Mesh.RelativeLocation', value='X=10,Y=0,Z=0').",
+    "Set a default property value on a Blueprint's Class Default Object (CDO). Supports dotted paths to traverse component subobjects (e.g. 'Mesh.SkeletalMesh', 'Mesh.AnimClass', 'Mesh.RelativeLocation', 'CharacterMovement.MaxWalkSpeed', 'CameraBoom.TargetArmLength'). Nested-struct paths inside a subobject (e.g. 'Mesh.RelativeLocation.X') are NOT supported — set the whole struct at parent level instead. Value formats by property type: TSubclassOf — BP asset name *without* '_C' suffix (e.g. 'ABP_Unarmed'); a C++ class name; or a full class path ending in '.Foo_C'. TObjectPtr / asset reference — full asset path with self-suffix (e.g. '/Game/Path/SKM_Manny_Simple.SKM_Manny_Simple') or a BP asset name. Simple types — literal value ('true', '42', '0.5', enum-name). Struct types — UE ImportText literal in parens, e.g. FVector '(X=0,Y=0,Z=-90)', FRotator '(Pitch=0,Yaw=-90,Roll=0)', FLinearColor '(R=1,G=0,B=0,A=1)'. The handler auto-wraps struct values that arrive without parens, but the canonical form is preferred.",
     {
-      blueprint: z.string().describe("Blueprint name or package path (e.g. 'HUD_WebUIInterface')"),
+      blueprint: z.string().describe("Blueprint name or package path (e.g. 'BP_CVPlayerCharacter')"),
       property: z.string().describe("Property name or dotted subobject path (e.g. 'WebUIWidgetClass', 'Mesh.SkeletalMesh', 'CharacterMovement.MaxWalkSpeed')"),
-      value: z.string().describe("Value to set. For class/object properties: Blueprint name, C++ class name, or full asset path. For simple types: the literal value (e.g. 'true', '42', '0.5'). For struct types: ImportText literal (e.g. 'X=10,Y=0,Z=0' for FVector)"),
+      value: z.string().describe("Value to set. TSubclassOf: BP name without '_C', C++ class, or full class path. TObjectPtr/asset: full path 'Package.Asset' or BP name. Simple: literal ('true', '42', '0.5'). Struct: parens-wrapped ImportText, e.g. '(X=0,Y=0,Z=-90)' for FVector, '(Pitch=0,Yaw=-90,Roll=0)' for FRotator"),
     },
     async ({ blueprint, property, value }) => {
       const err = await ensureUE();

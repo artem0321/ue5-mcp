@@ -2075,7 +2075,7 @@ FString FBlueprintMCPServer::HandleSetBlueprintDefault(const FString& Body)
 	// The most common shape: BP_Character.Mesh -> USkeletalMeshComponent CDO -> AnimClass.
 	// Nested-struct paths (e.g. "Mesh.RelativeLocation.X") are not supported — pass the
 	// whole struct as a literal at the parent level instead (e.g. property="Mesh.RelativeLocation",
-	// value="X=10,Y=0,Z=0").
+	// value="(X=10,Y=0,Z=0)"). The leaf setter auto-wraps struct values missing parens.
 	TArray<FString> PathSegments;
 	PropertyName.ParseIntoArray(PathSegments, TEXT("."));
 	if (PathSegments.Num() == 0)
@@ -2137,33 +2137,49 @@ FString FBlueprintMCPServer::HandleSetBlueprintDefault(const FString& Body)
 
 	if (ClassProp || SoftClassProp)
 	{
-		// Resolve the value to a UClass*
-		UClass* ResolvedClass = nullptr;
-
-		// Try as a C++ class name first
-		for (TObjectIterator<UClass> It; It; ++It)
+		// Resolve the value to a UClass*. Accept any of:
+		//   - C++/native class name ("UAnimInstance", "ABP_Unarmed_C")
+		//   - BP asset name without _C suffix ("ABP_Unarmed")
+		//   - Full BP path ("/Game/.../ABP_Unarmed")
+		//   - Full class path with _C suffix ("/Game/.../ABP_Unarmed.ABP_Unarmed_C")
+		auto TryResolveClass = [this](const FString& V) -> UClass*
 		{
-			if (It->GetName() == Value || It->GetName() == Value + TEXT("_C"))
+			// 1. Live class iteration (handles native and already-loaded BP classes)
+			for (TObjectIterator<UClass> It; It; ++It)
 			{
-				ResolvedClass = *It;
-				break;
+				if (It->GetName() == V || It->GetName() == V + TEXT("_C"))
+				{
+					return *It;
+				}
 			}
-		}
-
-		// Try loading as a Blueprint asset
-		if (!ResolvedClass)
-		{
+			// 2. BP asset path / short name
 			FString BPLoadError;
-			UBlueprint* ValueBP = LoadBlueprintByName(Value, BPLoadError);
+			UBlueprint* ValueBP = LoadBlueprintByName(V, BPLoadError);
 			if (ValueBP && ValueBP->GeneratedClass)
 			{
-				ResolvedClass = ValueBP->GeneratedClass;
+				return ValueBP->GeneratedClass;
 			}
+			// 3. Full class path ("/Game/.../Foo.Foo_C")
+			if (UClass* Loaded = StaticLoadClass(UObject::StaticClass(), nullptr, *V))
+			{
+				return Loaded;
+			}
+			return nullptr;
+		};
+
+		UClass* ResolvedClass = TryResolveClass(Value);
+
+		// Common stumble: caller passed "Foo_C" or path ".Foo_C" — retry without the suffix.
+		if (!ResolvedClass && Value.EndsWith(TEXT("_C")))
+		{
+			ResolvedClass = TryResolveClass(Value.LeftChop(2));
 		}
 
 		if (!ResolvedClass)
 		{
-			return MakeErrorJson(FString::Printf(TEXT("Could not resolve '%s' to a class"), *Value));
+			return MakeErrorJson(FString::Printf(
+				TEXT("Could not resolve '%s' to a class. For TSubclassOf, pass either the BP asset name (e.g. 'ABP_Unarmed', not 'ABP_Unarmed_C') or a C++ class name (e.g. 'UAnimInstance')."),
+				*Value));
 		}
 
 		// Validate meta class compatibility
@@ -2189,10 +2205,22 @@ FString FBlueprintMCPServer::HandleSetBlueprintDefault(const FString& Body)
 	// Handle object properties (TObjectPtr, UObject*)
 	else if (FObjectProperty* ObjProp = CastField<FObjectProperty>(Prop))
 	{
-		// Try finding an existing object/asset by name
+		// Try finding an existing object/asset. Accept any of:
+		//   - BP asset name ("BP_Foo")
+		//   - Full asset path with self-suffix ("/Game/.../SKM_Manny.SKM_Manny")
+		//   - Full asset path without self-suffix ("/Game/.../SKM_Manny") — auto-completed below
+		auto TryResolveObject = [](const FString& V) -> UObject*
+		{
+			if (UObject* O = StaticLoadObject(UObject::StaticClass(), nullptr, *V))
+			{
+				return O;
+			}
+			return FindObject<UObject>(nullptr, *V);
+		};
+
 		UObject* ResolvedObj = nullptr;
 
-		// Try loading as a Blueprint asset
+		// 1. Try BP asset
 		FString ObjLoadError;
 		UBlueprint* ValueBP = LoadBlueprintByName(Value, ObjLoadError);
 		if (ValueBP && ValueBP->GeneratedClass)
@@ -2200,20 +2228,29 @@ FString FBlueprintMCPServer::HandleSetBlueprintDefault(const FString& Body)
 			ResolvedObj = ValueBP->GeneratedClass->GetDefaultObject();
 		}
 
-		// Try loading as a generic asset (SkeletalMesh, StaticMesh, Texture, etc.)
-		// LoadObject<UObject> follows /Game/... paths and bare asset names via the asset registry.
+		// 2. Try generic asset path (SkeletalMesh, StaticMesh, Texture, …)
 		if (!ResolvedObj)
 		{
-			ResolvedObj = StaticLoadObject(UObject::StaticClass(), nullptr, *Value);
+			ResolvedObj = TryResolveObject(Value);
 		}
-		if (!ResolvedObj)
+
+		// 3. /Game/.../Foo without ".Foo" self-suffix → retry as /Game/.../Foo.Foo.
+		// Common stumble: docs across UE often quote both forms; StaticLoadObject only
+		// accepts the canonical "Package.Object" shape.
+		if (!ResolvedObj && Value.StartsWith(TEXT("/")) && !Value.Contains(TEXT(".")))
 		{
-			ResolvedObj = FindObject<UObject>(nullptr, *Value);
+			FString Head, LastSeg;
+			if (Value.Split(TEXT("/"), &Head, &LastSeg, ESearchCase::CaseSensitive, ESearchDir::FromEnd) && !LastSeg.IsEmpty())
+			{
+				ResolvedObj = TryResolveObject(Value + TEXT(".") + LastSeg);
+			}
 		}
 
 		if (!ResolvedObj)
 		{
-			return MakeErrorJson(FString::Printf(TEXT("Could not resolve '%s' to an object"), *Value));
+			return MakeErrorJson(FString::Printf(
+				TEXT("Could not resolve '%s' to an object. For asset properties (SkeletalMesh, StaticMesh, Texture, …), use a full path with self-suffix, e.g. '/Game/Path/SKM_Manny_Simple.SKM_Manny_Simple'. For Blueprint references, use the BP asset name."),
+				*Value));
 		}
 
 		// Validate the resolved object class against the property's allowed class
@@ -2233,17 +2270,39 @@ FString FBlueprintMCPServer::HandleSetBlueprintDefault(const FString& Body)
 	// Handle simple types via ImportText
 	else
 	{
-		const TCHAR* ImportResult = Prop->ImportText_Direct(*Value, Prop->ContainerPtrToValuePtr<void>(Container), Container, PPF_None);
+		void* LeafPtr = Prop->ContainerPtrToValuePtr<void>(Container);
+		const TCHAR* ImportResult = Prop->ImportText_Direct(*Value, LeafPtr, Container, PPF_None);
+
+		// Common stumble: struct literals (FVector, FRotator, FLinearColor, …) require
+		// surrounding parens — "X=0,Y=0,Z=-90" fails, "(X=0,Y=0,Z=-90)" works. Auto-wrap
+		// and retry so the caller doesn't have to know UE's struct ImportText quirk.
+		FString WrappedValue;
+		if (!ImportResult && CastField<FStructProperty>(Prop))
+		{
+			FString Trimmed = Value;
+			Trimmed.TrimStartAndEndInline();
+			if (!Trimmed.StartsWith(TEXT("(")))
+			{
+				WrappedValue = TEXT("(") + Trimmed + TEXT(")");
+				ImportResult = Prop->ImportText_Direct(*WrappedValue, LeafPtr, Container, PPF_None);
+			}
+		}
+
 		if (ImportResult)
 		{
-			Prop->ExportTextItem_Direct(ActualNewValue, Prop->ContainerPtrToValuePtr<void>(Container), nullptr, Container, PPF_None);
+			Prop->ExportTextItem_Direct(ActualNewValue, LeafPtr, nullptr, Container, PPF_None);
 			bSuccess = true;
 		}
 		else
 		{
+			FString Hint;
+			if (CastField<FStructProperty>(Prop))
+			{
+				Hint = TEXT(" (struct literals must be wrapped in parens, e.g. '(X=0,Y=0,Z=-90)' for FVector, '(Pitch=0,Yaw=-90,Roll=0)' for FRotator)");
+			}
 			return MakeErrorJson(FString::Printf(
-				TEXT("Failed to set property '%s' to '%s' — value could not be parsed for type '%s'"),
-				*PropertyName, *Value, *Prop->GetCPPType()));
+				TEXT("Failed to set property '%s' to '%s' — value could not be parsed for type '%s'%s"),
+				*PropertyName, *Value, *Prop->GetCPPType(), *Hint));
 		}
 	}
 
