@@ -6,7 +6,13 @@
 #include "LevelEditorViewport.h"
 #include "FileHelpers.h"
 #include "UObject/Package.h"
+#include "UObject/SavePackage.h"
+#include "UObject/UObjectIterator.h"
+#include "HAL/PlatformProcess.h"
+#include "HAL/PlatformFileManager.h"
+#include "GenericPlatform/GenericPlatformFile.h"
 #include "Misc/PackageName.h"
+#include "Misc/Paths.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "Serialization/JsonWriter.h"
@@ -171,6 +177,114 @@ FString FBlueprintMCPServer::HandleEditorNotification(const FString& Body)
 // HandleSaveAll — save all dirty packages
 // ============================================================
 
+namespace
+{
+	// Pick a representative top-level asset inside the package: prefer UWorld for
+	// .umap packages, otherwise the first RF_Public|RF_Standalone object. Returns
+	// nullptr if the package only contains transient/inner objects (skip those).
+	UObject* PickPrimaryAsset(UPackage* Package)
+	{
+		if (!Package) return nullptr;
+
+		UObject* PrimaryAsset = nullptr;
+		UWorld* MaybeWorld = nullptr;
+		ForEachObjectWithPackage(Package, [&PrimaryAsset, &MaybeWorld](UObject* Obj)
+		{
+			if (UWorld* W = Cast<UWorld>(Obj))
+			{
+				MaybeWorld = W;
+				return false; // stop — UWorld wins
+			}
+			if (!PrimaryAsset && Obj->HasAnyFlags(RF_Public | RF_Standalone) && !Obj->IsA<UPackage>())
+			{
+				PrimaryAsset = Obj;
+			}
+			return true;
+		});
+		return MaybeWorld ? static_cast<UObject*>(MaybeWorld) : PrimaryAsset;
+	}
+
+#if PLATFORM_WINDOWS
+	// SEH wrapper: UPackage::Save can crash with structured exceptions on rare
+	// edge cases (corrupted CDOs, bad replication metadata). Catch the SEH so
+	// the MCP server stays alive and we can move on to the next package.
+	__declspec(noinline) ESavePackageResult SavePackageInnerEditorUtils(
+		UPackage* Package, UObject* Asset, const TCHAR* Filename, FSavePackageArgs* Args)
+	{
+		return UPackage::Save(Package, Asset, Filename, *Args).Result;
+	}
+
+	int32 TrySavePackageEditorUtils(
+		UPackage* Package, UObject* Asset, const TCHAR* Filename,
+		FSavePackageArgs* Args, ESavePackageResult* OutResult)
+	{
+		__try
+		{
+			*OutResult = SavePackageInnerEditorUtils(Package, Asset, Filename, Args);
+			return 0;
+		}
+		__except (1)
+		{
+			*OutResult = ESavePackageResult::Error;
+			return -1;
+		}
+	}
+#endif
+
+	// Save one package with retry on transient sharing violations (Defender,
+	// Search Indexer, antivirus). Returns Success / Error and a short reason.
+	bool SaveSinglePackageWithRetry(UPackage* Package, FString& OutFilename, FString& OutReason)
+	{
+		UObject* Asset = PickPrimaryAsset(Package);
+		if (!Asset)
+		{
+			OutReason = TEXT("no top-level asset in package");
+			return false;
+		}
+
+		FString PackageExtension = Package->ContainsMap()
+			? FPackageName::GetMapPackageExtension()
+			: FPackageName::GetAssetPackageExtension();
+		OutFilename = FPaths::ConvertRelativePathToFull(
+			FPackageName::LongPackageNameToFilename(Package->GetName(), PackageExtension));
+
+		// Clear stale read-only attribute (source control / LFS).
+		IPlatformFile& PF = FPlatformFileManager::Get().GetPlatformFile();
+		if (PF.FileExists(*OutFilename) && PF.IsReadOnly(*OutFilename))
+		{
+			PF.SetReadOnly(*OutFilename, false);
+		}
+
+		FSavePackageArgs SaveArgs;
+		SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+		SaveArgs.SaveFlags = SAVE_NoError;
+
+		// 3 attempts × 100ms gap rides out the typical Defender/Indexer hold (<200ms).
+		ESavePackageResult Result = ESavePackageResult::Error;
+		for (int32 Attempt = 0; Attempt < 3; ++Attempt)
+		{
+			if (Attempt > 0)
+			{
+				FPlatformProcess::Sleep(0.1f);
+			}
+
+#if PLATFORM_WINDOWS
+			TrySavePackageEditorUtils(Package, Asset, *OutFilename, &SaveArgs, &Result);
+#else
+			Result = UPackage::Save(Package, Asset, *OutFilename, SaveArgs).Result;
+#endif
+
+			if (Result == ESavePackageResult::Success)
+			{
+				return true;
+			}
+		}
+
+		OutReason = FString::Printf(TEXT("UPackage::Save failed after 3 attempts (result=%d) — file may be locked by Defender / Indexer / external editor"), (int32)Result);
+		return false;
+	}
+}
+
 FString FBlueprintMCPServer::HandleSaveAll(const FString& Body)
 {
 	UE_LOG(LogTemp, Display, TEXT("BlueprintMCP: save_all()"));
@@ -180,14 +294,57 @@ FString FBlueprintMCPServer::HandleSaveAll(const FString& Body)
 		return MakeErrorJson(TEXT("save_all requires editor mode."));
 	}
 
-	bool bPromptUserToSave = false;
-	bool bSaveMapPackages = true;
-	bool bSaveContentPackages = true;
+	// Iterate dirty packages directly instead of FEditorFileUtils::SaveDirtyPackages.
+	// SaveDirtyPackages routes through the editor's UI layer, which surfaces a modal
+	// "Failed to save" dialog on UPackage::Save errors (notably ERROR_SHARING_VIOLATION
+	// when Windows Defender or the Search Indexer is holding the .uasset), and that
+	// modal blocks the entire editor + the MCP server. Custom path: SAVE_NoError +
+	// SEH-protected save + transient-failure retry, with a per-package failure list
+	// returned in the JSON response so callers can act on partial failures.
+	TArray<UPackage*> DirtyPackages;
+	FEditorFileUtils::GetDirtyPackages(DirtyPackages);
 
-	bool bSuccess = FEditorFileUtils::SaveDirtyPackages(bPromptUserToSave, bSaveMapPackages, bSaveContentPackages);
+	int32 SavedCount = 0;
+	int32 SkippedCount = 0;
+	TArray<TSharedPtr<FJsonValue>> Failures;
+
+	for (UPackage* Package : DirtyPackages)
+	{
+		if (!Package) { ++SkippedCount; continue; }
+
+		// Skip script / compiled-in / transient packages — they aren't meant to be saved.
+		if (Package->HasAnyPackageFlags(PKG_CompiledIn) ||
+			Package->HasAnyFlags(RF_Transient) ||
+			Package == GetTransientPackage())
+		{
+			++SkippedCount;
+			continue;
+		}
+
+		FString Filename;
+		FString Reason;
+		const bool bOk = SaveSinglePackageWithRetry(Package, Filename, Reason);
+		if (bOk)
+		{
+			++SavedCount;
+		}
+		else
+		{
+			TSharedRef<FJsonObject> FailObj = MakeShared<FJsonObject>();
+			FailObj->SetStringField(TEXT("package"), Package->GetName());
+			FailObj->SetStringField(TEXT("filename"), Filename);
+			FailObj->SetStringField(TEXT("reason"), Reason);
+			Failures.Add(MakeShared<FJsonValueObject>(FailObj));
+			UE_LOG(LogTemp, Warning, TEXT("BlueprintMCP: save_all — '%s' failed: %s"), *Package->GetName(), *Reason);
+		}
+	}
 
 	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
-	Result->SetBoolField(TEXT("success"), bSuccess);
+	Result->SetBoolField(TEXT("success"), Failures.Num() == 0);
+	Result->SetNumberField(TEXT("savedCount"), SavedCount);
+	Result->SetNumberField(TEXT("failedCount"), Failures.Num());
+	Result->SetNumberField(TEXT("skippedCount"), SkippedCount);
+	Result->SetArrayField(TEXT("failures"), Failures);
 
 	return JsonToString(Result);
 }

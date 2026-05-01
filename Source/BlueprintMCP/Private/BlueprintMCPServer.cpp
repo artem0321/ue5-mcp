@@ -1493,16 +1493,35 @@ bool FBlueprintMCPServer::SaveBlueprintPackage(UBlueprint* BP)
 	UE_LOG(LogTemp, Display, TEXT("BlueprintMCP:   Phase 3: Calling UPackage::Save (compiled=%s, isMap=%s)..."),
 		bCompiled ? TEXT("yes") : TEXT("no"), bIsMapPackage ? TEXT("yes") : TEXT("no"));
 
-#if PLATFORM_WINDOWS
-	int32 SEHCode = TrySavePackageSEH(Package, BaseObject, *PackageFilename, &SaveArgs, &SaveResult);
-	if (SEHCode != 0)
+	// Retry transient save failures (ERROR_SHARING_VIOLATION from Defender / Search
+	// Indexer / external editor briefly holding the .uasset). Three attempts with
+	// 100ms backoff covers the typical AV-scan window without becoming a lock-up.
+	// SEH crashes break out immediately — those aren't transient.
+	for (int32 Attempt = 0; Attempt < 3; ++Attempt)
 	{
-		UE_LOG(LogTemp, Error, TEXT("BlueprintMCP:   UPackage::Save CRASHED (SEH exception caught)"));
-	}
+		if (Attempt > 0)
+		{
+			UE_LOG(LogTemp, Display, TEXT("BlueprintMCP:   Save attempt %d/3 (previous result=%d)"), Attempt + 1, (int32)SaveResult);
+			FPlatformProcess::Sleep(0.1f);
+		}
+
+#if PLATFORM_WINDOWS
+		int32 SEHCode = TrySavePackageSEH(Package, BaseObject, *PackageFilename, &SaveArgs, &SaveResult);
+		if (SEHCode != 0)
+		{
+			UE_LOG(LogTemp, Error, TEXT("BlueprintMCP:   UPackage::Save CRASHED (SEH) on attempt %d — not retrying"), Attempt + 1);
+			break;
+		}
 #else
-	FSavePackageResultStruct Result = UPackage::Save(Package, BaseObject, *PackageFilename, SaveArgs);
-	SaveResult = Result.Result;
+		FSavePackageResultStruct InnerResult = UPackage::Save(Package, BaseObject, *PackageFilename, SaveArgs);
+		SaveResult = InnerResult.Result;
 #endif
+
+		if (SaveResult == ESavePackageResult::Success)
+		{
+			break;
+		}
+	}
 
 	// 6. Restore guards
 	BP->bIsRegeneratingOnLoad = OldRegen;

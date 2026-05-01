@@ -55,7 +55,7 @@ export function registerEditorUtilityTools(server: McpServer): void {
 
   server.tool(
     "save_all",
-    "Save all dirty (unsaved) packages in the editor, including maps and content. Requires editor mode.",
+    "Save all dirty (unsaved) packages in the editor, including maps and content. Requires editor mode. Each package is saved with SAVE_NoError + a 3-attempt retry on transient sharing violations (Defender / Search Indexer holding the .uasset), so a flaky lock won't surface a modal dialog. Per-package failures are returned in the response.",
     {},
     async () => {
       const err = await ensureUE();
@@ -64,11 +64,26 @@ export function registerEditorUtilityTools(server: McpServer): void {
       const data = await uePost("/api/save-all", {});
       if (data.error) return { content: [{ type: "text" as const, text: `Error: ${data.error}` }] };
 
-      const lines = [
-        data.success ? "All dirty packages saved successfully." : "Save completed with some failures.",
-        `\nNext steps:`,
-        `  1. Use get_dirty_packages to verify no unsaved changes remain`,
-      ];
+      const lines: string[] = [];
+      const saved = data.savedCount ?? 0;
+      const failed = data.failedCount ?? 0;
+      const skipped = data.skippedCount ?? 0;
+
+      if (failed === 0) {
+        lines.push(`All dirty packages saved successfully (${saved} saved, ${skipped} skipped).`);
+      } else {
+        lines.push(`Save completed with ${failed} failure(s) — ${saved} saved, ${skipped} skipped.`);
+        for (const f of (data.failures ?? [])) {
+          lines.push(`  FAILED ${f.package}: ${f.reason}`);
+          if (f.filename) lines.push(`         ${f.filename}`);
+        }
+        lines.push(``);
+        lines.push(`Common cause: file lock held by Windows Defender / Search Indexer / external editor.`);
+        lines.push(`Retry save_all in a few seconds, or close any external process holding the file.`);
+      }
+
+      lines.push(`\nNext steps:`);
+      lines.push(`  1. Use get_dirty_packages to verify no unsaved changes remain`);
 
       return { content: [{ type: "text" as const, text: lines.join("\n") }] };
     }
