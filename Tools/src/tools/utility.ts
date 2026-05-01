@@ -1,21 +1,47 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { ensureUE, ueGet, uePost, isUEHealthy, gracefulShutdown, state } from "../ue-bridge.js";
+import { ensureUE, ueGet, uePost, getUEHealth, isUEHealthy, gracefulShutdown, state } from "../ue-bridge.js";
 
 export function registerUtilityTools(server: McpServer): void {
   server.tool(
     "server_status",
-    "Check UE5 Blueprint server status. Starts the server if not running (blocks until ready).",
+    "Report UE5 Blueprint server reachability. Read-only — does NOT spawn a commandlet, does NOT block waiting for startup. If the server is not currently reachable, says so and notes that other tool calls will spawn one. Returns: running (editor/commandlet) with index counts, or starting (a spawn is already in flight), or not running.",
     {},
     async () => {
-      const err = await ensureUE();
-      if (err) return { content: [{ type: "text" as const, text: err }] };
+      // Probe directly. ensureUE() is intentionally NOT called: this is a status
+      // query, and triggering a 3-minute commandlet spawn wait from a status check
+      // is the wrong default. If the server is up, report it; if not, say so.
+      const health = await getUEHealth();
+      if (health) {
+        // Side effect: if a stale spawn is still registered, drop it. The fact
+        // that /api/health responds means whatever process answers (editor or a
+        // commandlet we didn't spawn) is good — clear the stale handle so the
+        // next ensureUE() doesn't try to kill it on line 244.
+        if (state.ueProcess && health.mode === "editor") {
+          state.ueProcess = null;
+        }
+        state.editorMode = health.mode === "editor";
+        return {
+          content: [{
+            type: "text" as const,
+            text: `UE5 Blueprint server is running (${health.mode} mode).\nBlueprints indexed: ${health.blueprintCount}\nMaps indexed: ${health.mapCount ?? "?"}`,
+          }],
+        };
+      }
 
-      const data = await ueGet("/api/health");
+      if (state.startupPromise) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: "UE5 Blueprint server is starting (a commandlet spawn is in flight). Retry server_status in ~30s, or call any blueprint tool to wait on the same startup.",
+          }],
+        };
+      }
+
       return {
         content: [{
           type: "text" as const,
-          text: `UE5 Blueprint server is running (${data.mode ?? (state.editorMode ? "editor" : "commandlet")} mode).\nBlueprints indexed: ${data.blueprintCount}\nMaps indexed: ${data.mapCount ?? "?"}`,
+          text: "UE5 Blueprint server is not reachable on port 9847. Open the editor (preferred) or call any blueprint tool to spawn a headless commandlet.",
         }],
       };
     }

@@ -250,7 +250,21 @@ export async function ensureUE(): Promise<string | null> {
 
   // Spawn and block until ready (shared promise prevents double-spawn)
   state.startupPromise = spawnAndWait().finally(() => { state.startupPromise = null; });
-  return state.startupPromise;
+  const spawnErr = await state.startupPromise;
+
+  // Race-tolerance: if spawn returned an error string but the server is in fact
+  // reachable now (e.g. the user opened the editor while we were polling, or the
+  // commandlet bound the port just as our deadline elapsed), prefer the live
+  // observation over the cached error. Without this, a stale "failed within
+  // 3 minutes" would propagate to every queued caller.
+  if (spawnErr) {
+    const lateHealth = await getUEHealth();
+    if (lateHealth) {
+      state.editorMode = lateHealth.mode === "editor";
+      return null;
+    }
+  }
+  return spawnErr;
 }
 
 // --- HTTP helpers ---
