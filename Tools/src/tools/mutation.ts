@@ -559,11 +559,11 @@ export function registerMutationTools(server: McpServer): void {
 
   server.tool(
     "set_blueprint_default",
-    "Set a default property value on a Blueprint's Class Default Object (CDO). Supports TSubclassOf (class references), object references, and simple types (bool, int, float, string, enum). For class/object values, provide the Blueprint asset name (e.g. 'MyWidget') or C++ class name.",
+    "Set a default property value on a Blueprint's Class Default Object (CDO). Supports TSubclassOf (class references), object references (assets like SkeletalMesh, StaticMesh, etc.), and simple types (bool, int, float, string, enum, struct). For class/object values, provide the Blueprint asset name, C++ class name, or full asset path. Supports dotted paths to traverse component subobjects (e.g. 'Mesh.SkeletalMesh', 'Mesh.AnimClass', 'CharacterMovement.MaxWalkSpeed', 'CameraBoom.TargetArmLength'). Nested-struct paths inside a subobject (e.g. 'Mesh.RelativeLocation.X') are NOT supported — pass a struct literal instead (property='Mesh.RelativeLocation', value='X=10,Y=0,Z=0').",
     {
       blueprint: z.string().describe("Blueprint name or package path (e.g. 'HUD_WebUIInterface')"),
-      property: z.string().describe("Property name as declared in C++ or Blueprint (e.g. 'WebUIWidgetClass')"),
-      value: z.string().describe("Value to set. For class properties: Blueprint name or C++ class name. For simple types: the literal value (e.g. 'true', '42', '0.5')"),
+      property: z.string().describe("Property name or dotted subobject path (e.g. 'WebUIWidgetClass', 'Mesh.SkeletalMesh', 'CharacterMovement.MaxWalkSpeed')"),
+      value: z.string().describe("Value to set. For class/object properties: Blueprint name, C++ class name, or full asset path. For simple types: the literal value (e.g. 'true', '42', '0.5'). For struct types: ImportText literal (e.g. 'X=10,Y=0,Z=0' for FVector)"),
     },
     async ({ blueprint, property, value }) => {
       const err = await ensureUE();

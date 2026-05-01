@@ -2070,14 +2070,63 @@ FString FBlueprintMCPServer::HandleSetBlueprintDefault(const FString& Body)
 		return MakeErrorJson(TEXT("Could not get Class Default Object"));
 	}
 
-	FProperty* Prop = BP->GeneratedClass->FindPropertyByName(*PropertyName);
+	// Walk a dotted path (e.g. "Mesh.AnimClass") through FObjectProperty subobjects,
+	// stopping at the leaf segment which is then applied with the existing setter logic.
+	// The most common shape: BP_Character.Mesh -> USkeletalMeshComponent CDO -> AnimClass.
+	// Nested-struct paths (e.g. "Mesh.RelativeLocation.X") are not supported — pass the
+	// whole struct as a literal at the parent level instead (e.g. property="Mesh.RelativeLocation",
+	// value="X=10,Y=0,Z=0").
+	TArray<FString> PathSegments;
+	PropertyName.ParseIntoArray(PathSegments, TEXT("."));
+	if (PathSegments.Num() == 0)
+	{
+		return MakeErrorJson(TEXT("Empty property path"));
+	}
+
+	UObject* Container = CDO;
+	UStruct* OwningStruct = BP->GeneratedClass;
+
+	for (int32 SegIdx = 0; SegIdx + 1 < PathSegments.Num(); ++SegIdx)
+	{
+		const FString& Seg = PathSegments[SegIdx];
+		FProperty* SegProp = OwningStruct->FindPropertyByName(*Seg);
+		if (!SegProp)
+		{
+			return MakeErrorJson(FString::Printf(
+				TEXT("Property '%s' not found at path segment %d ('%s') on '%s'"),
+				*Seg, SegIdx, *PropertyName, *OwningStruct->GetName()));
+		}
+
+		FObjectProperty* SegObjProp = CastField<FObjectProperty>(SegProp);
+		if (!SegObjProp)
+		{
+			return MakeErrorJson(FString::Printf(
+				TEXT("Path segment '%s' is type '%s' — only object/component subobject traversal is supported (use a struct literal at the parent level instead)"),
+				*Seg, *SegProp->GetCPPType()));
+		}
+
+		UObject* SubObject = SegObjProp->GetObjectPropertyValue_InContainer(Container);
+		if (!SubObject)
+		{
+			return MakeErrorJson(FString::Printf(
+				TEXT("Subobject at segment '%s' is null on '%s'"), *Seg, *Container->GetName()));
+		}
+
+		Container = SubObject;
+		OwningStruct = SubObject->GetClass();
+	}
+
+	const FString& LeafName = PathSegments.Last();
+	FProperty* Prop = OwningStruct->FindPropertyByName(*LeafName);
 	if (!Prop)
 	{
-		return MakeErrorJson(FString::Printf(TEXT("Property '%s' not found on '%s'"), *PropertyName, *BlueprintName));
+		return MakeErrorJson(FString::Printf(
+			TEXT("Property '%s' not found on '%s' (full path '%s')"),
+			*LeafName, *OwningStruct->GetName(), *PropertyName));
 	}
 
 	FString OldValue;
-	Prop->ExportTextItem_Direct(OldValue, Prop->ContainerPtrToValuePtr<void>(CDO), nullptr, CDO, PPF_None);
+	Prop->ExportTextItem_Direct(OldValue, Prop->ContainerPtrToValuePtr<void>(Container), nullptr, Container, PPF_None);
 
 	bool bSuccess = false;
 	FString ActualNewValue;
@@ -2127,12 +2176,12 @@ FString FBlueprintMCPServer::HandleSetBlueprintDefault(const FString& Body)
 					TEXT("'%s' is not a subclass of '%s' (required by property '%s')"),
 					*ResolvedClass->GetName(), *MetaClass->GetName(), *PropertyName));
 			}
-			ClassProp->SetPropertyValue_InContainer(CDO, ResolvedClass);
+			ClassProp->SetPropertyValue_InContainer(Container, ResolvedClass);
 		}
 		else
 		{
 			FSoftObjectPtr SoftPtr(ResolvedClass);
-			SoftClassProp->SetPropertyValue_InContainer(CDO, SoftPtr);
+			SoftClassProp->SetPropertyValue_InContainer(Container, SoftPtr);
 		}
 		ActualNewValue = ResolvedClass->GetName();
 		bSuccess = true;
@@ -2151,22 +2200,43 @@ FString FBlueprintMCPServer::HandleSetBlueprintDefault(const FString& Body)
 			ResolvedObj = ValueBP->GeneratedClass->GetDefaultObject();
 		}
 
+		// Try loading as a generic asset (SkeletalMesh, StaticMesh, Texture, etc.)
+		// LoadObject<UObject> follows /Game/... paths and bare asset names via the asset registry.
+		if (!ResolvedObj)
+		{
+			ResolvedObj = StaticLoadObject(UObject::StaticClass(), nullptr, *Value);
+		}
+		if (!ResolvedObj)
+		{
+			ResolvedObj = FindObject<UObject>(nullptr, *Value);
+		}
+
 		if (!ResolvedObj)
 		{
 			return MakeErrorJson(FString::Printf(TEXT("Could not resolve '%s' to an object"), *Value));
 		}
 
-		ObjProp->SetPropertyValue_InContainer(CDO, ResolvedObj);
+		// Validate the resolved object class against the property's allowed class
+		UClass* PropClass = ObjProp->PropertyClass;
+		if (PropClass && !ResolvedObj->IsA(PropClass))
+		{
+			return MakeErrorJson(FString::Printf(
+				TEXT("'%s' (class '%s') is not a '%s' (required by property '%s')"),
+				*ResolvedObj->GetName(), *ResolvedObj->GetClass()->GetName(),
+				*PropClass->GetName(), *LeafName));
+		}
+
+		ObjProp->SetPropertyValue_InContainer(Container, ResolvedObj);
 		ActualNewValue = ResolvedObj->GetName();
 		bSuccess = true;
 	}
 	// Handle simple types via ImportText
 	else
 	{
-		const TCHAR* ImportResult = Prop->ImportText_Direct(*Value, Prop->ContainerPtrToValuePtr<void>(CDO), CDO, PPF_None);
+		const TCHAR* ImportResult = Prop->ImportText_Direct(*Value, Prop->ContainerPtrToValuePtr<void>(Container), Container, PPF_None);
 		if (ImportResult)
 		{
-			Prop->ExportTextItem_Direct(ActualNewValue, Prop->ContainerPtrToValuePtr<void>(CDO), nullptr, CDO, PPF_None);
+			Prop->ExportTextItem_Direct(ActualNewValue, Prop->ContainerPtrToValuePtr<void>(Container), nullptr, Container, PPF_None);
 			bSuccess = true;
 		}
 		else
@@ -2182,7 +2252,13 @@ FString FBlueprintMCPServer::HandleSetBlueprintDefault(const FString& Body)
 		return MakeErrorJson(TEXT("Failed to set property value"));
 	}
 
-	// Mark modified and save
+	// Mark modified and save. When the leaf lives on a subobject (Container != CDO),
+	// also dirty the subobject so the engine includes it in the BP package on save.
+	if (Container != CDO)
+	{
+		Container->Modify();
+		Container->MarkPackageDirty();
+	}
 	CDO->MarkPackageDirty();
 	BP->Modify();
 

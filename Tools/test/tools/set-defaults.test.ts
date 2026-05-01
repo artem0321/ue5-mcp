@@ -40,6 +40,52 @@ describe("set_blueprint_default", () => {
   });
 });
 
+// Subobject (dotted-path) traversal — verifies that "Mesh.AnimClass",
+// "CharacterMovement.MaxWalkSpeed" and similar reach into component CDOs.
+describe("set_blueprint_default — subobject path", () => {
+  const bpName = uniqueName("BP_SetDefaultSubobjTest");
+  const packagePath = "/Game/Test";
+
+  beforeAll(async () => {
+    const bp = await createTestBlueprint({ name: bpName, parentClass: "Character" });
+    expect(bp.error).toBeUndefined();
+  });
+
+  afterAll(async () => {
+    await deleteTestBlueprint(`${packagePath}/${bpName}`);
+  });
+
+  it("sets a float on the CharacterMovement component CDO", async () => {
+    const data = await uePost("/api/set-blueprint-default", {
+      blueprint: bpName,
+      property: "CharacterMovement.MaxWalkSpeed",
+      value: "777",
+    });
+    expect(data.error).toBeUndefined();
+    expect(data.success).toBe(true);
+    expect(data.newValue).toBe("777.000000");
+    expect(data.saved).toBe(true);
+  });
+
+  it("returns error when middle segment is not an object property", async () => {
+    const data = await uePost("/api/set-blueprint-default", {
+      blueprint: bpName,
+      property: "bCanBeDamaged.Foo",
+      value: "true",
+    });
+    expect(data.error).toBeDefined();
+  });
+
+  it("returns error when leaf is missing on the subobject", async () => {
+    const data = await uePost("/api/set-blueprint-default", {
+      blueprint: bpName,
+      property: "CharacterMovement.NotARealProperty_XYZ",
+      value: "1",
+    });
+    expect(data.error).toBeDefined();
+  });
+});
+
 describe("set_pin_default", () => {
   const bpName = uniqueName("BP_SetPinTest");
   const packagePath = "/Game/Test";
