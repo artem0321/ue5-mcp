@@ -468,6 +468,36 @@ bool FBlueprintMCPServer::Start(int32 InPort, bool bEditorMode)
 	ARM.Get().GetAssetsByClass(UMaterialFunction::StaticClass()->GetClassPathName(), AllMaterialFunctionAssets, false);
 	UE_LOG(LogTemp, Display, TEXT("BlueprintMCP: Found %d Material Function assets."), AllMaterialFunctionAssets.Num());
 
+	// Pre-flight: probe whether the port is already taken (e.g. another UnrealEditor.exe
+	// hosting its own MCP server). UE's HttpServerModule logs a warning on bind failure
+	// but otherwise reports success, and an HTTP-level health probe answers from the
+	// process that already owns the port — so we'd silently run as a second, useless
+	// instance. A direct FSocket::Bind on the same address fails fast when the port
+	// is taken, giving us a clean, early error.
+	{
+		ISocketSubsystem* SocketSub = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
+		FSocket* Probe = SocketSub ? SocketSub->CreateSocket(NAME_Stream, TEXT("BlueprintMCP port probe"), false) : nullptr;
+		if (Probe)
+		{
+			TSharedRef<FInternetAddr> Addr = SocketSub->CreateInternetAddr();
+			bool bIpValid = false;
+			Addr->SetIp(TEXT("127.0.0.1"), bIpValid);
+			Addr->SetPort(Port);
+			const bool bCanBind = bIpValid && Probe->Bind(*Addr);
+			Probe->Close();
+			SocketSub->DestroySocket(Probe);
+
+			if (!bCanBind)
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("BlueprintMCP: Port %d is already in use — another UnrealEditor.exe is likely running and holds the MCP server. ")
+					TEXT("Close the other editor (Get-Process UnrealEditor) before starting this one."), Port);
+				return false;
+			}
+		}
+		// Tiny race window between Probe close and StartAllListeners is acceptable.
+	}
+
 	// Start HTTP server
 	FHttpServerModule& HttpModule = FModuleManager::LoadModuleChecked<FHttpServerModule>("HTTPServer");
 	TSharedPtr<IHttpRouter> Router = HttpModule.GetHttpRouter(Port);
@@ -507,6 +537,7 @@ bool FBlueprintMCPServer::Start(int32 InPort, bool bEditorMode)
 				TSharedRef<FJsonObject> J = MakeShared<FJsonObject>();
 				J->SetStringField(TEXT("status"), TEXT("ok"));
 				J->SetStringField(TEXT("mode"), bIsEditor ? TEXT("editor") : TEXT("commandlet"));
+				J->SetNumberField(TEXT("pid"), (double)FPlatformProcess::GetCurrentProcessId());
 				J->SetNumberField(TEXT("blueprintCount"), AllBlueprintAssets.Num());
 				J->SetNumberField(TEXT("mapCount"), AllMapAssets.Num());
 				J->SetNumberField(TEXT("materialCount"), AllMaterialAssets.Num());
@@ -946,37 +977,10 @@ bool FBlueprintMCPServer::Start(int32 InPort, bool bEditorMode)
 
 	HttpModule.StartAllListeners();
 
-	// Verify the listener actually bound by attempting a TCP connection
-	bool bListenerReady = false;
-	for (int32 Attempt = 0; Attempt < 5; ++Attempt)
-	{
-		FSocket* TestSocket = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM)->CreateSocket(NAME_Stream, TEXT("BlueprintMCP bind test"), false);
-		if (TestSocket)
-		{
-			TSharedRef<FInternetAddr> Addr = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM)->CreateInternetAddr();
-			bool bIsValid = false;
-			Addr->SetIp(TEXT("127.0.0.1"), bIsValid);
-			Addr->SetPort(Port);
-			bool bConnected = TestSocket->Connect(*Addr);
-			TestSocket->Close();
-			ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM)->DestroySocket(TestSocket);
-
-			if (bConnected)
-			{
-				bListenerReady = true;
-				break;
-			}
-		}
-		UE_LOG(LogTemp, Warning, TEXT("BlueprintMCP: Bind check attempt %d/5 failed on port %d, retrying..."), Attempt + 1, Port);
-		FPlatformProcess::Sleep(1.0f);
-	}
-
-	if (!bListenerReady)
-	{
-		UE_LOG(LogTemp, Error, TEXT("BlueprintMCP: Failed to bind HTTP listener on port %d. Port may be in use."), Port);
-		HttpModule.StopAllListeners();
-		return false;
-	}
+	// We've already proven the port is free above; trust StartAllListeners.
+	// (The previous "TCP Connect to 127.0.0.1:Port" check was unsound when a second
+	// UnrealEditor was running — Connect would succeed against the OTHER process's
+	// listener and we'd report ourselves as bound while serving zero traffic.)
 
 	bRunning = true;
 	UE_LOG(LogTemp, Display, TEXT("BlueprintMCP: Server listening on http://localhost:%d"), Port);
