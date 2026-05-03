@@ -99,6 +99,52 @@ export function registerUtilityTools(server: McpServer): void {
   );
 
   server.tool(
+    "run_python",
+    "Execute Python in the editor and return captured stdout/stderr/exception in one round-trip. Replaces the `exec_command(\"py <path>\") + Read(Saved/python_test.txt)` boilerplate. Pass either inline code or a path to a .py file (with optional positional args) — file detection is automatic for `.py` extensions. Uncaught exceptions land in the response (`success=false`, traceback in `result`, error entries in `log`); no need to wrap probes in try/except just for capture. Editor-only — Python module must be loaded.",
+    {
+      script: z.string().describe("Inline Python code OR path to a .py file (with optional positional args, e.g. \"C:/path/to/probe.py arg1 arg2\"). The `.py` extension auto-routes to file execution; otherwise treated as literal code."),
+      mode: z.enum(["file", "statement", "eval"]).optional().describe("Execution mode. \"file\" (default) handles both inline scripts and .py files. \"statement\" runs a single Python statement. \"eval\" evaluates a single expression and returns its value in `result`."),
+      unattended: z.boolean().optional().describe("Run with GIsRunningUnattendedScript=true to suppress modal UI prompts. Default true — set false only when the script needs interactive dialogs."),
+    },
+    async ({ script, mode, unattended }) => {
+      const err = await ensureUE();
+      if (err) return { content: [{ type: "text" as const, text: err }] };
+
+      const body: Record<string, unknown> = { script };
+      if (mode !== undefined) body.mode = mode;
+      if (unattended !== undefined) body.unattended = unattended;
+
+      const data = await uePost("/api/run-python", body);
+      if (data.error) {
+        return { content: [{ type: "text" as const, text: `Error: ${data.error}` }] };
+      }
+
+      const lines: string[] = [
+        `Success: ${data.success}`,
+        `Mode: ${data.mode}`,
+      ];
+      if (typeof data.errorCount === "number" && data.errorCount > 0) {
+        lines.push(`Errors: ${data.errorCount}`);
+      }
+      if (typeof data.warningCount === "number" && data.warningCount > 0) {
+        lines.push(`Warnings: ${data.warningCount}`);
+      }
+      if (data.result) {
+        lines.push("", "Result:", String(data.result));
+      }
+      if (Array.isArray(data.log) && data.log.length > 0) {
+        lines.push("", "Log:");
+        for (const entry of data.log) {
+          const type = entry?.type ?? "?";
+          const text = entry?.output ?? "";
+          lines.push(`  [${type}] ${text}`);
+        }
+      }
+      return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+    }
+  );
+
+  server.tool(
     "shutdown_server",
     "Shut down the UE5 Blueprint server to free memory (~2-4 GB). The server will auto-restart on the next blueprint tool call. Use this when done with blueprint analysis. Cannot shut down the editor — only the standalone commandlet.",
     {},

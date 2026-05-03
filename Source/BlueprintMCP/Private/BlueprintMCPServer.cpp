@@ -33,6 +33,10 @@
 #include "HttpServerModule.h"
 #include "IHttpRouter.h"
 #include "HttpPath.h"
+#if WITH_EDITOR
+#include "IPythonScriptPlugin.h"
+#include "PythonScriptTypes.h"
+#endif
 #include "SocketSubsystem.h"
 #include "Sockets.h"
 #include "UObject/SavePackage.h"
@@ -824,6 +828,10 @@ bool FBlueprintMCPServer::Start(int32 InPort, bool bEditorMode)
 	Router->BindRoute(FHttpPath(TEXT("/api/exec")), EHttpServerRequestVerbs::VERB_POST,
 		QueuedHandler(TEXT("exec")));
 
+	// Python execution with captured stdout/stderr/exception
+	Router->BindRoute(FHttpPath(TEXT("/api/run-python")), EHttpServerRequestVerbs::VERB_POST,
+		QueuedHandler(TEXT("runPython")));
+
 	// Level actor tools
 	Router->BindRoute(FHttpPath(TEXT("/api/attach-actor")), EHttpServerRequestVerbs::VERB_POST,
 		QueuedHandler(TEXT("attachActor")));
@@ -1252,6 +1260,7 @@ void FBlueprintMCPServer::RegisterHandlers()
 
 	// Console command execution
 	HandlerMap.Add(TEXT("exec"),                    [this](const TMap<FString, FString>&, const FString& B) { return HandleExecCommand(B); });
+	HandlerMap.Add(TEXT("runPython"),               [this](const TMap<FString, FString>&, const FString& B) { return HandleRunPython(B); });
 
 	// Level actor handlers
 	HandlerMap.Add(TEXT("attachActor"), [this](const TMap<FString, FString>&, const FString& B) { return HandleAttachActor(B); });
@@ -2458,4 +2467,120 @@ FString FBlueprintMCPServer::HandleExecCommand(const FString& Body)
 	Result->SetStringField(TEXT("output"), OutputCapture.CapturedOutput);
 
 	return JsonToString(Result);
+}
+
+// ============================================================
+// HandleRunPython — execute Python via PythonScriptPlugin with captured log/exception
+// ============================================================
+//
+// Body schema:
+//   { "script": "<inline code OR /path/to/file.py [args...]>",   // required, mutually exclusive with file
+//     "file":   "<path/to/file.py [args...]>",                    // alt to script — convenience alias
+//     "mode":   "file" | "statement" | "eval",                    // optional, default "file"
+//     "unattended": true|false }                                  // optional, default true
+//
+// Response:
+//   { "success": bool,
+//     "mode":    "file|statement|eval",
+//     "result":  "<CommandResult — exception traceback on failure, eval value on success>",
+//     "log":     [ { "type": "Info|Warning|Error", "output": "..." }, ... ],
+//     "errorCount":   int,   // count of Error entries in log
+//     "warningCount": int }
+//
+// Mode "file" uses ExecuteFile semantics — auto-detects ".py" in the script and runs as file
+// (with optional positional args), otherwise runs as a multi-statement string. This matches
+// what FPythonScriptPlugin already does for `py "<path>"` from the console.
+
+FString FBlueprintMCPServer::HandleRunPython(const FString& Body)
+{
+#if !WITH_EDITOR
+	return MakeErrorJson(TEXT("run_python is only available in editor builds."));
+#else
+	if (!bIsEditor)
+	{
+		return MakeErrorJson(TEXT("run_python is only available in editor mode (not in headless commandlet without GEditor)."));
+	}
+
+	TSharedPtr<FJsonObject> Json = ParseBodyJson(Body);
+	if (!Json.IsValid())
+	{
+		return MakeErrorJson(TEXT("Invalid JSON body."));
+	}
+
+	FString Script;
+	if (!Json->TryGetStringField(TEXT("script"), Script) || Script.IsEmpty())
+	{
+		// 'file' is an alias for caller convenience
+		Json->TryGetStringField(TEXT("file"), Script);
+	}
+	if (Script.IsEmpty())
+	{
+		return MakeErrorJson(TEXT("Missing required field: 'script' (inline Python code or path to .py file)."));
+	}
+
+	FString ModeStr = TEXT("file");
+	Json->TryGetStringField(TEXT("mode"), ModeStr);
+
+	EPythonCommandExecutionMode Mode = EPythonCommandExecutionMode::ExecuteFile;
+	if (ModeStr.Equals(TEXT("statement"), ESearchCase::IgnoreCase))
+	{
+		Mode = EPythonCommandExecutionMode::ExecuteStatement;
+	}
+	else if (ModeStr.Equals(TEXT("eval"), ESearchCase::IgnoreCase) || ModeStr.Equals(TEXT("evaluate"), ESearchCase::IgnoreCase))
+	{
+		Mode = EPythonCommandExecutionMode::EvaluateStatement;
+	}
+	else if (!ModeStr.Equals(TEXT("file"), ESearchCase::IgnoreCase))
+	{
+		return MakeErrorJson(FString::Printf(TEXT("Unknown mode '%s'. Expected one of: file, statement, eval."), *ModeStr));
+	}
+
+	bool bUnattended = true;
+	Json->TryGetBoolField(TEXT("unattended"), bUnattended);
+
+	IPythonScriptPlugin* PyPlugin = IPythonScriptPlugin::Get();
+	if (!PyPlugin)
+	{
+		return MakeErrorJson(TEXT("PythonScriptPlugin module is not loaded. Enable 'Python Editor Script Plugin' in the editor."));
+	}
+	if (!PyPlugin->IsPythonAvailable() || !PyPlugin->IsPythonInitialized())
+	{
+		return MakeErrorJson(TEXT("Python is not initialized. Wait for the editor to finish loading and retry."));
+	}
+
+	UE_LOG(LogTemp, Display, TEXT("BlueprintMCP: run_python (mode=%s, %d chars)"), *ModeStr, Script.Len());
+
+	FPythonCommandEx Cmd;
+	Cmd.Command = Script;
+	Cmd.ExecutionMode = Mode;
+	Cmd.FileExecutionScope = EPythonFileExecutionScope::Private;
+	Cmd.Flags = bUnattended ? EPythonCommandFlags::Unattended : EPythonCommandFlags::None;
+
+	const bool bSuccess = PyPlugin->ExecPythonCommandEx(Cmd);
+
+	int32 ErrorCount = 0;
+	int32 WarningCount = 0;
+	TArray<TSharedPtr<FJsonValue>> LogArray;
+	LogArray.Reserve(Cmd.LogOutput.Num());
+	for (const FPythonLogOutputEntry& Entry : Cmd.LogOutput)
+	{
+		TSharedRef<FJsonObject> EntryObj = MakeShared<FJsonObject>();
+		EntryObj->SetStringField(TEXT("type"), LexToString(Entry.Type));
+		EntryObj->SetStringField(TEXT("output"), Entry.Output);
+		LogArray.Add(MakeShared<FJsonValueObject>(EntryObj));
+
+		if (Entry.Type == EPythonLogOutputType::Error)   { ++ErrorCount; }
+		if (Entry.Type == EPythonLogOutputType::Warning) { ++WarningCount; }
+	}
+
+	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("success"), bSuccess);
+	Result->SetStringField(TEXT("mode"), ModeStr);
+	Result->SetStringField(TEXT("result"), Cmd.CommandResult);
+	Result->SetArrayField(TEXT("log"), LogArray);
+	Result->SetNumberField(TEXT("errorCount"), ErrorCount);
+	Result->SetNumberField(TEXT("warningCount"), WarningCount);
+
+	return JsonToString(Result);
+#endif
 }

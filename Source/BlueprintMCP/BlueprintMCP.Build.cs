@@ -36,5 +36,12 @@ public class BlueprintMCP : ModuleRules
 			"UMGEditor",
 			"SlateCore"
 		});
+
+		// PythonScriptPlugin is UncookedOnly; we are an Editor module so this is fine.
+		// Used by HandleRunPython to capture stdout/stderr/exception via ExecPythonCommandEx.
+		if (Target.bBuildEditor)
+		{
+			PrivateDependencyModuleNames.Add("PythonScriptPlugin");
+		}
 	}
 }

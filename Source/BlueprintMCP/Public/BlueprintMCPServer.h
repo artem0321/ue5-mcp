@@ -201,6 +201,7 @@ private:
 	FString HandleDiffMaterialGraph(const FString& Body);
 	FString HandleRestoreMaterialGraph(const FString& Body);
 	FString HandleExecCommand(const FString& Body);
+	FString HandleRunPython(const FString& Body);
 
 
 	// ----- Level actor tools -----
